@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Counterweight</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Jost:wght@500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;background:#E4E0D5;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+'use strict';
+
+// ------------------------------------------------------------------ constants
+const W = 640, H = 900;              // logical size
+const S0 = 20, S1 = 620, C = 320;    // painting square + its centre
+const PAPER = '#F8F6F0', BG = '#ECE8DE', INK = '#141414', MUTED = '#8C877C';
+const COL = { red: '#D52A1E', blue: '#1E3E93', yellow: '#F3C21A' };
+const WEIGHT = { red: 1.0, blue: 1.25, yellow: 0.6 };    // visual weight per colour
+const NOTES = { red: [261.63, 392.0, 523.25], blue: [196.0, 293.66, 349.23], yellow: [329.63, 440.0, 466.16] };
+const G = 1500, BALL_R = 9, MAXV = 2400;
+const LINE_R = 5, FRAME_R = 7, FUNNEL_R = 4;
+const LP = { x: 212, y: 796 }, RP = { x: 428, y: 796 };  // flipper pivots
+const STEP = 1 / 720;                 // physics substep
+const ROT_DUR = 0.55, CHARGE = 0.45, ROT_COOLDOWN = 1.2;
+const GOAL = 1;                       // at least one painted cell
+// balanced zone shrinks with each composition: 20, 17, 14, 11, 9, 8 … px (v1 was a fixed 18)
+let finaleTol = 8;
+const tol = () => (comp && comp.finale) ? finaleTol : Math.max(8, 20 - (compNo - 1) * 3 - (compNo > 4 ? 1 : 0));
+
+// ------------------------------------------------------------------ canvas
+const cv = document.getElementById('c'); let ctx = cv.getContext('2d');
+let scale = 1, dpr = 1;
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  scale = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = W * scale + 'px'; cv.style.height = H * scale + 'px';
+  cv.width = Math.round(W * scale * dpr); cv.height = Math.round(H * scale * dpr);
+}
+addEventListener('resize', resize); resize();
+
+// ------------------------------------------------------------------ utils
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const snap = v => Math.round(v / 10) * 10;
+const easeInOut = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+
+// ------------------------------------------------------------------ composition generator
+// A Mondrian-like recursive partition. Every dividing line gets 1–2 gaps so the ball can pass.
+function makeLine(x0, y0, x1, y1, rnd) {
+  const L = Math.hypot(x1 - x0, y1 - y0), n = L > 330 ? 2 : 1, gaps = [];
+  for (let i = 0; i < n; i++) {
+    const gw = 62 + rnd() * 22, lo = i * L / n, hi = (i + 1) * L / n;
+    const c = lo + gw / 2 + rnd() * Math.max(0, hi - lo - gw);
+    gaps.push([c - gw / 2, c + gw / 2]);
+  }
+  const pieces = []; let t = 0;
+  for (const g of gaps) { if (g[0] - t > 4) pieces.push([t, g[0]]); t = g[1]; }
+  if (L - t > 4) pieces.push([t, L]);
+  return { x0, y0, x1, y1, L, gaps, pieces };
+}
+
+function tryGenerate(seed, force) {
+  const rnd = mulberry32(seed), lines = [], leaves = [];
+  (function split(x0, y0, x1, y1, d) {
+    const w = x1 - x0, h = y1 - y0, canV = w >= 170, canH = h >= 170;
+    if ((!canV && !canH) || d >= 5 || (d >= 2 && rnd() < 0.3)) { leaves.push({ x0, y0, x1, y1 }); return; }
+    const vert = canV && (!canH || rnd() < (w > h ? 0.8 : 0.2));
+    if (vert) { const x = snap(x0 + w * (0.28 + rnd() * 0.44)); lines.push(makeLine(x, y0, x, y1, rnd)); split(x0, y0, x, y1, d + 1); split(x, y0, x1, y1, d + 1); }
+    else      { const y = snap(y0 + h * (0.28 + rnd() * 0.44)); lines.push(makeLine(x0, y, x1, y, rnd)); split(x0, y0, x1, y, d + 1); split(x0, y, x1, y1, d + 1); }
+  })(S0, S0, S1, S1, 0);
+
+  leaves.forEach((l, i) => Object.assign(l, { id: i, adj: new Set(), solid: null, color: null, prevColor: null, prog: 0, progColor: null, fillT: 1, flash: 0, w: null }));
+  const leafAt = (x, y) => leaves.find(l => x > l.x0 && x < l.x1 && y > l.y0 && y < l.y1);
+  for (const ln of lines) {
+    const dx = (ln.x1 - ln.x0) / ln.L, dy = (ln.y1 - ln.y0) / ln.L, nx = -dy, ny = dx;
+    for (const g of ln.gaps) {
+      const c = (g[0] + g[1]) / 2, px = ln.x0 + dx * c, py = ln.y0 + dy * c;
+      const a = leafAt(px + nx * 12, py + ny * 12), b = leafAt(px - nx * 12, py - ny * 12);
+      if (a && b && a !== b) { a.adj.add(b); b.adj.add(a); }
+    }
+  }
+  // all open cells must be reachable, and every edge must have an open cell (any edge can become the bottom)
+  const connectedOK = () => {
+    const open = leaves.filter(l => !l.solid); if (!open.length) return false;
+    const seen = new Set([open[0]]), q = [open[0]];
+    while (q.length) { const l = q.pop(); for (const n of l.adj) if (!n.solid && !seen.has(n)) { seen.add(n); q.push(n); } }
+    if (seen.size !== open.length) return false;
+    return [l => l.x0 === S0, l => l.x1 === S1, l => l.y0 === S0, l => l.y1 === S1].every(f => open.some(f));
+  };
+  if (!connectedOK() && !force) return null;
+
+  const cands = leaves.filter(l => { const w = l.x1 - l.x0, h = l.y1 - l.y0; return Math.min(w, h) >= 60 && w * h <= 50000; });
+  for (let i = cands.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [cands[i], cands[j]] = [cands[j], cands[i]]; }
+  const palette = ['red', 'blue', 'yellow', rnd() < 0.5 ? 'red' : 'blue'];
+  let placed = 0;
+  for (const l of cands) {
+    if (placed >= palette.length) break;
+    l.solid = palette[placed];
+    if (connectedOK() || force) placed++; else l.solid = null;
+  }
+  // A gap must always be a real passage: close every gap that opens onto a solid colour block
+  // (checked along the whole gap, not just its middle), then re-check that every open cell is still reachable.
+  for (const ln of lines) {
+    const dx = (ln.x1 - ln.x0) / ln.L, dy = (ln.y1 - ln.y0) / ln.L, nx = -dy, ny = dx;
+    // line ends that meet this line (T-junctions), as distances along it
+    const joins = [];
+    for (const o of lines) if (o !== ln) for (const [ex, ey] of [[o.x0, o.y0], [o.x1, o.y1]]) {
+      const t = (ex - ln.x0) * dx + (ey - ln.y0) * dy, off = Math.abs((ex - ln.x0) * nx + (ey - ln.y0) * ny);
+      if (off < 2 && t > 0 && t < ln.L) joins.push(t);
+    }
+    const okGap = g => {
+      if (g[0] < 0 || g[1] > ln.L) return false;
+      if (joins.some(t => t > g[0] - 14 && t < g[1] + 14)) return false;   // a meeting line would cut the doorway in half
+      for (let k = 0; k <= 4; k++) {                                        // must open onto open cells on both sides
+        const c = g[0] + (g[1] - g[0]) * (0.1 + 0.2 * k), px = ln.x0 + dx * c, py = ln.y0 + dy * c;
+        const a = leafAt(px + nx * 12, py + ny * 12), b = leafAt(px - nx * 12, py - ny * 12);
+        if (!a || !b || a.solid || b.solid) return false;
+      }
+      return true;
+    };
+    // keep good gaps; slide bad ones along the line to the nearest good spot; drop only if there is none
+    ln.gaps = ln.gaps.map(g => {
+      if (okGap(g)) return g;
+      const w = g[1] - g[0], c0 = (g[0] + g[1]) / 2;
+      for (let d = 8; d < ln.L; d += 8) for (const c of [c0 + d, c0 - d]) { const ng = [c - w / 2, c + w / 2]; if (okGap(ng)) return ng; }
+      return null;
+    }).filter(Boolean).sort((a, b) => a[0] - b[0]);
+    const pieces = []; let t = 0;
+    for (const g of ln.gaps) { if (g[0] - t > 4) pieces.push([t, g[0]]); t = Math.max(t, g[1]); }
+    if (ln.L - t > 4) pieces.push([t, ln.L]);
+    ln.pieces = pieces;
+  }
+  for (const l of leaves) l.adj.clear();
+  for (const ln of lines) {
+    const dx = (ln.x1 - ln.x0) / ln.L, dy = (ln.y1 - ln.y0) / ln.L, nx = -dy, ny = dx;
+    for (const g of ln.gaps) {
+      const c = (g[0] + g[1]) / 2, px = ln.x0 + dx * c, py = ln.y0 + dy * c;
+      const a = leafAt(px + nx * 12, py + ny * 12), b = leafAt(px - nx * 12, py - ny * 12);
+      if (a && b && a !== b) { a.adj.add(b); b.adj.add(a); }
+    }
+  }
+  if (!force && !connectedOK()) return null;
+  if (!force && (placed < 3 || leaves.filter(l => !l.solid).length < 6)) return null;
+  return { lines, leaves, seed };
+}
+function generate(seed) {
+  for (let a = 0; a < 150; a++) { const c = tryGenerate(seed * 101 + a); if (c) return c; }
+  return tryGenerate(seed, true);
+}
+
+// ------------------------------------------------------------------ world (composition rotated by K quarter-turns)
+const FIXED = [
+  { ax: S0, ay: S0, bx: S1, by: S0, r: FRAME_R },
+  { ax: S0, ay: S0, bx: S0, by: S1, r: FRAME_R },
+  { ax: S1, ay: S0, bx: S1, by: S1, r: FRAME_R },
+  { ax: S0, ay: S1, bx: LP.x, by: LP.y, r: FUNNEL_R },
+  { ax: S1, ay: S1, bx: RP.x, by: RP.y, r: FUNNEL_R },
+];
+function rp(x, y, k) { let dx = x - C, dy = y - C; for (let i = 0; i < k; i++) { const t = dx; dx = -dy; dy = t; } return [C + dx, C + dy]; }
+function rr(r, k) { const a = rp(r.x0, r.y0, k), b = rp(r.x1, r.y1, k); return { x0: Math.min(a[0], b[0]), y0: Math.min(a[1], b[1]), x1: Math.max(a[0], b[0]), y1: Math.max(a[1], b[1]) }; }
+
+let comp, K = 0, compNo = 1;
+const world = { segs: [], solids: [], cells: [] };
+function buildWorld() {
+  world.segs = FIXED.slice(); world.solids = []; world.cells = [];
+  for (const ln of comp.lines) {
+    const dx = (ln.x1 - ln.x0) / ln.L, dy = (ln.y1 - ln.y0) / ln.L;
+    for (const p of ln.pieces) {
+      const a = rp(ln.x0 + dx * p[0], ln.y0 + dy * p[0], K), b = rp(ln.x0 + dx * p[1], ln.y0 + dy * p[1], K);
+      world.segs.push({ ax: a[0], ay: a[1], bx: b[0], by: b[1], r: LINE_R, inner: true });
+    }
+  }
+  for (const l of comp.leaves) { const r = rr(l, K); r.leaf = l; l.w = r; (l.solid ? world.solids : world.cells).push(r); }
+}
+
+// ------------------------------------------------------------------ ball + flippers
+const B = { x: C, y: 60, vx: 0, vy: 0, r: BALL_R, color: null, alive: false };
+const trail = [];
+const FL = { L: 92, px: LP.x, py: LP.y, rest: 0.50, up: -0.40, th: 0.50, w: 0 };
+const FR = { L: 92, px: RP.x, py: RP.y, rest: Math.PI - 0.50, up: Math.PI + 0.40, th: Math.PI - 0.50, w: 0 };
+
+function updateFlipper(f, held, dt) {
+  const target = held ? f.up : f.rest, sp = held ? 24 : 15, prev = f.th, diff = target - f.th, step = sp * dt;
+  f.th = Math.abs(diff) <= step ? target : f.th + Math.sign(diff) * step;
+  f.w = (f.th - prev) / dt;
+}
+
+let wallSoundCd = 0;
+function collideSeg(s) {
+  const abx = s.bx - s.ax, aby = s.by - s.ay;
+  const t = clamp(((B.x - s.ax) * abx + (B.y - s.ay) * aby) / (abx * abx + aby * aby), 0, 1);
+  const px = s.ax + abx * t, py = s.ay + aby * t;
+  const dx = B.x - px, dy = B.y - py, d2 = dx * dx + dy * dy, R = B.r + s.r;
+  if (d2 >= R * R) return;
+  const d = Math.sqrt(d2) || 1e-4, nx = dx / d, ny = dy / d;
+  B.x = px + nx * R; B.y = py + ny * R;
+  const vn = B.vx * nx + B.vy * ny;
+  if (vn < 0) {
+    B.vx -= 1.5 * vn * nx; B.vy -= 1.5 * vn * ny;           // restitution 0.5
+    B.vx *= 0.9995; B.vy *= 0.9995;
+    if (vn < -280 && wallSoundCd <= 0) { tone(1500, 0.03, 0.04, 'sine'); wallSoundCd = 0.05; }
+  }
+}
+function collideBox(r) {
+  const x0 = r.x0 - LINE_R, y0 = r.y0 - LINE_R, x1 = r.x1 + LINE_R, y1 = r.y1 + LINE_R;
+  const cx = clamp(B.x, x0, x1), cy = clamp(B.y, y0, y1), dx = B.x - cx, dy = B.y - cy, d2 = dx * dx + dy * dy;
+  let nx, ny, pen;
+  if (d2 === 0) {
+    // never push the ball out through a side that sits against the outer frame
+    const l = r.x0 <= S0 + 1 ? Infinity : B.x - x0, rt = r.x1 >= S1 - 1 ? Infinity : x1 - B.x;
+    const t = r.y0 <= S0 + 1 ? Infinity : B.y - y0, b = y1 - B.y, m = Math.min(l, rt, t, b);
+    if (m === l) { nx = -1; ny = 0; pen = l + B.r; } else if (m === rt) { nx = 1; ny = 0; pen = rt + B.r; }
+    else if (m === t) { nx = 0; ny = -1; pen = t + B.r; } else { nx = 0; ny = 1; pen = b + B.r; }
+  } else {
+    if (d2 >= B.r * B.r) return;
+    const d = Math.sqrt(d2); nx = dx / d; ny = dy / d; pen = B.r - d;
+  }
+  B.x += nx * pen; B.y += ny * pen;
+  const vn = B.vx * nx + B.vy * ny;
+  if (vn < 0) {
+    B.vx -= 1.75 * vn * nx; B.vy -= 1.75 * vn * ny;          // restitution 0.75
+    if (vn < -60) { B.vx += nx * 380; B.vy += ny * 380; hitBumper(r.leaf); }
+  }
+}
+function collideFlipper(f) {
+  const c = Math.cos(f.th), s = Math.sin(f.th);
+  const rx = B.x - f.px, ry = B.y - f.py, t = clamp((rx * c + ry * s) / f.L, 0, 1);
+  const qx = f.px + c * f.L * t, qy = f.py + s * f.L * t, R = B.r + (12 - 5 * t);
+  const dx = B.x - qx, dy = B.y - qy, d2 = dx * dx + dy * dy;
+  if (d2 >= R * R) return;
+  const d = Math.sqrt(d2) || 1e-4, nx = dx / d, ny = dy / d;
+  B.x = qx + nx * R; B.y = qy + ny * R;
+  const ox = B.x - f.px, oy = B.y - f.py, vsx = -f.w * oy, vsy = f.w * ox;   // flipper surface velocity
+  let vrx = B.vx - vsx, vry = B.vy - vsy; const vn = vrx * nx + vry * ny;
+  if (vn < 0) { vrx -= 1.35 * vn * nx; vry -= 1.35 * vn * ny; B.vx = vrx + vsx; B.vy = vry + vsy; }
+}
+function physStep(dt) {
+  B.vy += G * dt; B.x += B.vx * dt; B.y += B.vy * dt;
+  for (const r of world.solids) collideBox(r);
+  for (const s of world.segs) collideSeg(s);
+  collideFlipper(FL); collideFlipper(FR);
+  const sp = Math.hypot(B.vx, B.vy); if (sp > MAXV) { B.vx *= MAXV / sp; B.vy *= MAXV / sp; }
+  // safety net: the ball can never leave the table through the frame
+  const lo = S0 + FRAME_R + B.r, hi = S1 - FRAME_R - B.r;
+  if (B.y < lo) { B.y = lo; B.vy = Math.abs(B.vy) * 0.5; }
+  if (B.x < lo) { B.x = lo; B.vx = Math.abs(B.vx) * 0.5; }
+  if (B.x > hi) { B.x = hi; B.vx = -Math.abs(B.vx) * 0.5; }
+}
+
+function hitBumper(leaf) {
+  leaf.flash = 1;
+  B.color = leaf.solid;
+  hitNote(leaf.solid);
+  shake = Math.min(shake + 2.5, 6);
+}
+
+function freeAt(x, y) {
+  for (const r of world.solids) if (x > r.x0 - 16 && x < r.x1 + 16 && y > r.y0 - 16 && y < r.y1 + 16) return false;
+  for (const s of world.segs) {
+    const abx = s.bx - s.ax, aby = s.by - s.ay, t = clamp(((x - s.ax) * abx + (y - s.ay) * aby) / (abx * abx + aby * aby), 0, 1);
+    if (Math.hypot(x - s.ax - abx * t, y - s.ay - aby * t) < B.r + s.r + 4) return false;
+  }
+  return true;
+}
+function spawnBall() {
+  let x = C, y = S0 + 30;
+  outer: for (y = S0 + 30; y < S1 - 30; y += 30) for (const o of [0, 40, -40, 80, -80, 120, -120, 160, -160, 200, -200, 240, -240]) if (freeAt(C + o, y)) { x = C + o; break outer; }
+  Object.assign(B, { x, y, vx: (Math.random() - .5) * 120, vy: 0, color: null, alive: true });
+  trail.length = 0; still = 0;
+}
+
+// ------------------------------------------------------------------ balance
+function balance() {
+  let sw = 0, sx = 0, n = 0;
+  if (comp.finale) {                       // the wall: each hung painting weighs what you painted into it
+    for (const l of comp.leaves) if (l.tile != null && l.hung) { n++; sw += l.weight; sx += l.weight * (l.w.x0 + l.w.x1) / 2; }
+    return { dx: sw ? sx / sw - C : 0, painted: n };
+  }
+  for (const l of comp.leaves) {
+    const c = l.solid || l.color; if (!c) continue; if (!l.solid) n++;
+    const r = l.w, a = (r.x1 - r.x0) * (r.y1 - r.y0) * WEIGHT[c];
+    sw += a; sx += a * (r.x0 + r.x1) / 2;
+  }
+  return { dx: sw ? sx / sw - C : 0, painted: n };
+}
+function checkBalance() {
+  const b = balance();
+  if (b.painted >= GOAL && Math.abs(b.dx) < tol() && state === 'play') startWin();
+}
+
+// ------------------------------------------------------------------ audio (all synthesized)
+let AC = null, master = null;
+function initAudio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); master = AC.createGain(); master.gain.value = 0.55; master.connect(AC.destination); } catch (e) { AC = null; } }
+  if (AC && AC.state === 'suspended') AC.resume().catch(() => {});
+}
+let muted = false;
+function tone(freq, dur, vol, type = 'triangle', when = 0, toFreq) {
+  if (muted) return;
+  if (!AC) return;
+  const t = AC.currentTime + when, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t);
+  if (toFreq) o.frequency.exponentialRampToValueAtTime(toFreq, t + dur);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(master); o.start(t); o.stop(t + dur + 0.03);
+}
+function piano(f, vol = 0.22, when = 0) { tone(f, 0.7, vol, 'triangle', when); tone(f * 2, 0.25, vol * 0.3, 'sine', when); }
+const BEAT = 60 / 100, PROG = [0, 0, 0, 0, 5, 5, 0, 0, 7, 5, 0, 7], WALK = [0, 4, 7, 9, 10, 9, 7, 4];
+const VOICE = { blue: [-12, -8, -5, -2], red: [0, 4, 7, 10], yellow: [7, 10, 12, 16] };
+let musNext = 0, musStep = 0;
+function musicTick() {
+  if (!AC || muted || AC.state !== 'running') { musNext = 0; return; }
+  if (musNext < AC.currentTime) musNext = AC.currentTime + 0.06;
+  while (musNext < AC.currentTime + 0.2) {
+    const bar = Math.floor(musStep / 8) % 12, i = musStep % 8, f = 65.41 * Math.pow(2, (PROG[bar] + WALK[i]) / 12), w = musNext - AC.currentTime;
+    tone(f * 2, 0.34, 0.055, 'sine', w);
+    musNext += i % 2 === 0 ? BEAT * 0.58 : BEAT * 0.42; musStep++;          // swung eighths
+  }
+}
+const onBeat = () => { if (!AC || !musNext) return 0; const w = musNext - AC.currentTime; return w > 0 && w < 0.13 ? w : 0; };
+const curRoot = () => PROG[Math.floor(Math.max(0, musStep - 1) / 8) % 12];
+function hitNote(color) {
+  const v = VOICE[color], t = v[Math.floor(Math.random() * v.length)];
+  piano(261.63 * Math.pow(2, (curRoot() + t) / 12), 0.2, onBeat());
+}
+function chord(color) { const w = onBeat(); VOICE[color].forEach((t, i) => piano(261.63 * Math.pow(2, (curRoot() + t) / 12), 0.11, w + i * 0.05)); }
+
+// ------------------------------------------------------------------ input
+const held = {}, touches = new Map();
+const LEFT = ['ShiftLeft', 'KeyZ', 'ArrowLeft'], RIGHT = ['ShiftRight', 'Slash', 'ArrowRight'];
+// Work out which side a key belongs to. Shift is matched by code, by key+location and by keyCode,
+// because some keyboards / input methods report it differently.
+let lastKey = '';
+function sideCode(e) {
+  if (LEFT.includes(e.code) || RIGHT.includes(e.code)) return e.code;
+  const isShift = e.key === 'Shift' || e.keyCode === 16;
+  if (isShift && e.location === 1) return 'ShiftLeft';
+  if (isShift && e.location === 2) return 'ShiftRight';
+  if (e.key === 'z' || e.key === 'Z') return 'KeyZ';
+  if (e.key === '/') return 'Slash';
+  return null;
+}
+addEventListener('keydown', e => {
+  lastKey = `${e.code || '—'} · ${e.key} · loc ${e.location}`;
+  if (state === 'gallery') {
+    if (e.code === 'Enter' && !e.repeat) { e.preventDefault(); playAgain(); }
+    else if (e.code === 'Backspace') { e.preventDefault(); sig = sig.slice(0, -1); }
+    else if (/^[a-zA-Z0-9.]$/.test(e.key) && sig.length < 3) { sig += e.key.toUpperCase(); tone(880, 0.05, 0.05, 'sine'); }
+    return;
+  }
+  if (e.code === 'Escape' && !e.repeat) { e.preventDefault(); if (state === 'pause') resume(); else pause(); return; }
+  if (state === 'pause') {
+    if (e.code === 'ArrowUp' || e.code === 'KeyW') { menuSel = (menuSel + MENU.length - 1) % MENU.length; e.preventDefault(); }
+    else if (e.code === 'ArrowDown' || e.code === 'KeyS') { menuSel = (menuSel + 1) % MENU.length; e.preventDefault(); }
+    else if ((e.code === 'Enter' || e.code === 'Space') && !e.repeat) { e.preventDefault(); MENU[menuSel].act(); }
+    return;
+  }
+  const sc = sideCode(e);
+  if (sc) { e.preventDefault(); held[sc] = true; if (!e.repeat) onAnyInput(); }
+  else if (state === 'title' && (e.code === 'Enter' || e.code === 'Space') && !e.repeat) { e.preventDefault(); startGame(); }
+  else if (state === 'gallery' && !e.repeat && (e.code === 'Enter' || e.code === 'Space')) { e.preventDefault(); playAgain(); }
+  else if (state === 'gallery' && !e.repeat && e.code === 'KeyS') saveCollection();
+}, true);
+addEventListener('keyup', e => {
+  const sc = sideCode(e); if (sc) held[sc] = false;
+  held[e.code] = false;
+  // Windows sometimes swallows the keyup of the first Shift when both are held
+  if ((sc === 'ShiftLeft' || sc === 'ShiftRight') && !e.shiftKey) held.ShiftLeft = held.ShiftRight = false;
+}, true);
+addEventListener('blur', () => { for (const k in held) held[k] = false; touches.clear(); });
+cv.tabIndex = 0;
+addEventListener('pointerdown', () => { try { window.focus(); cv.focus({ preventScroll: true }); } catch (_) {} }, true);
+const BTN = { x: 80, y: 588, w: 216, h: 56 };
+let btnHover = false;
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault(); onAnyInput();
+  const r = cv.getBoundingClientRect();
+  if (state === 'title') {
+    const x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    if (x > BTN.x && x < BTN.x + BTN.w && y > BTN.y && y < BTN.y + BTN.h) startGame();
+    return;
+  }
+  {
+    const x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+    if (state === 'pause') { const i = menuAt(x, y); if (i >= 0) { menuSel = i; MENU[i].act(); } return; }
+    if (state === 'gallery') { const i = gbtnAt(x, y); if (i === 0) saveCollection(); else if (i === 1) playAgain(); return; }
+    if (x > PBTN.x - 6 && x < PBTN.x + PBTN.w + 6 && y > PBTN.y - 6 && y < PBTN.y + PBTN.h + 6) { pause(); return; }
+  }
+  touches.set(e.pointerId, (e.clientX - r.left) < r.width / 2 ? 'L' : 'R');
+  try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+});
+const pUp = e => touches.delete(e.pointerId);
+cv.addEventListener('pointerup', pUp); cv.addEventListener('pointercancel', pUp);
+cv.addEventListener('pointermove', e => {
+  const r = cv.getBoundingClientRect(), x = (e.clientX - r.left) / scale, y = (e.clientY - r.top) / scale;
+  if (state === 'pause') { const i = menuAt(x, y); if (i >= 0) menuSel = i; cv.style.cursor = i >= 0 ? 'pointer' : ''; return; }
+  if (state === 'gallery') { galHover = gbtnAt(x, y); cv.style.cursor = galHover >= 0 ? 'pointer' : ''; return; }
+  if (state !== 'title') { btnHover = false; cv.style.cursor = (x > PBTN.x - 6 && x < PBTN.x + PBTN.w + 6 && y > PBTN.y - 6 && y < PBTN.y + PBTN.h + 6) ? 'pointer' : ''; return; }
+  btnHover = x > BTN.x && x < BTN.x + BTN.w && y > BTN.y && y < BTN.y + BTN.h;
+  cv.style.cursor = btnHover ? 'pointer' : '';
+});
+const isLeft = () => LEFT.some(k => held[k]) || [...touches.values()].includes('L');
+const isRight = () => RIGHT.some(k => held[k]) || [...touches.values()].includes('R');
+
+function onAnyInput() { initAudio(); }
+// ---- finale: a 4×4 wall; your eight paintings hang on alternate squares
+let paintWeights = [], finLeaf = null;
+function paintingWeight() { let w = 0; for (const l of comp.leaves) { const c = l.solid || l.color; if (c) w += (l.x1 - l.x0) * (l.y1 - l.y0) * WEIGHT[c]; } return w; }
+function makeFinale() {
+  const lines = [], leaves = [], P = [S0, 170, 320, 470, S1];
+  const mk = (x0, y0, x1, y1) => {
+    const L = 600, gaps = [0, 1, 2, 3].map(i => [i * 150 + 40, i * 150 + 110]), pieces = []; let t = 0;
+    for (const g of gaps) { pieces.push([t, g[0]]); t = g[1]; } pieces.push([t, L]);
+    return { x0, y0, x1, y1, L, gaps, pieces };
+  };
+  for (const v of [170, 320, 470]) { lines.push(mk(v, S0, v, S1)); lines.push(mk(S0, v, S1, v)); }
+  const slots = [];
+  for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) {
+    const l = { x0: P[c], y0: P[r], x1: P[c + 1], y1: P[r + 1], id: leaves.length, adj: new Set(), solid: null, color: null, prevColor: null,
+      prog: 0, progColor: null, fillT: 1, flash: 0, w: null, tile: null, hung: false, visited: false, hangT: 1, weight: 0 };
+    leaves.push(l); if ((r + c) % 2 === 0) slots.push(l);
+  }
+  // choose a hanging order that can be balanced (some set of paintings, in some orientation), widening the zone only if needed
+  const solvable = (order, tolr) => {
+    for (let k = 0; k < 4; k++) for (let m = 1; m < 256; m++) {
+      let sw = 0, sx = 0;
+      for (let i = 0; i < 8; i++) if (m >> i & 1) { const l = slots[i], q = rp((l.x0 + l.x1) / 2, (l.y0 + l.y1) / 2, k), w = paintWeights[order[i]]; sw += w; sx += w * q[0]; }
+      if (Math.abs(sx / sw - C) < tolr) return true;
+    }
+    return false;
+  };
+  let order = [0, 1, 2, 3, 4, 5, 6, 7], found = false;
+  for (finaleTol = 30; finaleTol <= 60 && !found; finaleTol += 6) {
+    for (let a = 0; a < 60 && !found; a++) {
+      for (let i = 7; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+      found = solvable(order, finaleTol);
+    }
+    if (found) break;
+  }
+  slots.forEach((l, i) => { l.tile = order[i]; l.weight = paintWeights[order[i]] || 1; });
+  return { lines, leaves, finale: true };
+}
+function loadComp() {
+  const fin = false;   // the exhibition-wall finale was cut: nine ordinary compositions
+  comp = fin ? makeFinale() : generate(1000 + compNo * 7); K = 0; finLeaf = null; buildWorld();
+}
+const TEST_FINALE = false;
+function jumpToFinale() {
+  collection = []; paintWeights = [];
+  for (compNo = 1; compNo < TOTAL; compNo++) {
+    comp = generate(1000 + compNo * 7); K = 0; buildWorld();
+    const cols = ['red', 'blue', 'yellow'];
+    for (const l of comp.leaves) if (!l.solid && Math.random() < 0.5) l.color = cols[Math.floor(Math.random() * 3)];
+    collection[compNo - 1] = snapshot(); paintWeights[compNo - 1] = paintingWeight();
+  }
+  compNo = TOTAL; loadComp();
+}
+function startGame() { initAudio(); if (state === 'title') { if (TEST_FINALE) jumpToFinale(); state = 'play'; spawnBall(); } }
+
+// ------------------------------------------------------------------ state machine
+let state = 'title', time = 0, acc = 0, shake = 0, groundT = 0;
+// ---- the collection: nine compositions, then a 3×3 of everything you balanced
+const TOTAL = 9;
+let sig = '';
+let collection = [], galT = 0, galHover = -1, saveOverlay = null;
+const GBTN = [{ x: 80, y: 714, w: 220, h: 56, label: 'SAVE IMAGE' }, { x: 320, y: 714, w: 220, h: 56, label: 'PLAY AGAIN' }];
+function snapshot() {                      // render the finished painting on its own, without ball or frame
+  const off = document.createElement('canvas'); off.width = off.height = 600;
+  const saved = ctx; ctx = off.getContext('2d');
+  ctx.fillStyle = PAPER; ctx.fillRect(0, 0, 600, 600);
+  ctx.translate(-S0, -S0);
+  for (const l of comp.leaves) { l.flash = 0; l.prog = 0; l.progColor = null; }
+  drawComposition();
+  ctx = saved; return off;
+}
+function collectionImage() {
+  const T = 600, G = 24, N = 3, size = N * T + (N + 1) * G, foot = 96;
+  const c = document.createElement('canvas'); c.width = size; c.height = size + foot;
+  const x = c.getContext('2d'); x.fillStyle = INK; x.fillRect(0, 0, c.width, c.height);
+  collection.forEach((im, i) => x.drawImage(im, G + (i % N) * (T + G), G + Math.floor(i / N) * (T + G), T, T));
+  const F = '"Jost","Futura","Helvetica Neue",Arial,sans-serif';
+  x.fillStyle = PAPER; x.textBaseline = 'alphabetic';
+  if ('letterSpacing' in x) x.letterSpacing = '10px';
+  x.font = '700 34px ' + F; x.textAlign = 'left'; x.fillText('COUNTERWEIGHT', G, size + 54);
+  if (sig) { x.font = '700 44px ' + F; x.textAlign = 'right'; x.fillText(sig, size - G - 4, size + 58); }
+  return c.toDataURL('image/png');
+}
+function saveCollection() {
+  const url = collectionImage();
+  try { const a = document.createElement('a'); a.href = url; a.download = 'counterweight-collection.png'; document.body.appendChild(a); a.click(); a.remove(); } catch (_) {}
+  // also show it full size, so it can be right-clicked / long-pressed and saved anywhere
+  if (saveOverlay) saveOverlay.remove();
+  const d = document.createElement('div');
+  d.style.cssText = 'position:fixed;inset:0;background:rgba(248,246,240,0.96);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;z-index:10;font-family:Jost,Futura,Helvetica,Arial,sans-serif;';
+  d.innerHTML = `<img src="${url}" alt="Your Counterweight collection" style="max-width:min(86vw,78vh);max-height:78vh;display:block">
+    <div style="font-size:12px;font-weight:700;letter-spacing:2.5px;color:#8C877C">RIGHT-CLICK OR LONG-PRESS THE IMAGE TO SAVE IT</div>
+    <button style="font:700 13px Jost,Futura,Helvetica,Arial,sans-serif;letter-spacing:5px;padding:14px 28px;border:0;background:#141414;color:#F8F6F0;cursor:pointer">CLOSE</button>`;
+  d.querySelector('button').onclick = () => { d.remove(); saveOverlay = null; };
+  document.body.appendChild(d); saveOverlay = d;
+}
+function playAgain() {
+  collection = []; paintWeights = []; compNo = 1; loadComp();
+  if (TEST_FINALE) jumpToFinale();
+  state = 'play'; rotCd = 0; charge = 0; spawnBall();
+}
+function gbtnAt(x, y) { return GBTN.findIndex(b => x > b.x && x < b.x + b.w && y > b.y && y < b.y + b.h); }
+let charge = 0, rotCd = 0, rotT = 0, ballInSq = false, winT = 0, swapped = false;
+let still = 0, respawnT = 0, beam = 0, prevL = false, prevR = false, drains = 0;
+
+// ------------------------------------------------------------------ pause menu
+const PBTN = { x: 588, y: 826, w: 16, h: 18 };          // on-screen pause button (bottom right)
+let resumeState = 'play', menuSel = 0;
+const MENU = [
+  { label: () => 'RESUME', act: () => resume() },
+  { label: () => 'RESTART', act: () => restartComposition() },
+  { label: () => muted ? 'SOUND OFF' : 'SOUND ON', act: () => { muted = !muted; } },
+  { label: () => 'QUIT', act: () => quitToTitle() },
+];
+const MENU_X = 200, MENU_Y0 = 380, MENU_DY = 60;
+function menuAt(x, y) { for (let i = 0; i < MENU.length; i++) { const my = MENU_Y0 + i * MENU_DY; if (x > MENU_X - 40 && x < MENU_X + 300 && y > my - 36 && y < my + 14) return i; } return -1; }
+function pause() {
+  if (state === 'title' || state === 'pause' || state === 'gallery') return;
+  resumeState = state; state = 'pause'; menuSel = 0;
+  for (const k in held) held[k] = false; touches.clear();
+}
+function resume() { if (state === 'pause') { state = resumeState; acc = 0; } }
+function restartComposition() {
+  loadComp();
+  state = 'play'; rotCd = 0; charge = 0; spawnBall();
+}
+function quitToTitle() {
+  collection = []; paintWeights = []; compNo = 1; loadComp();
+  B.alive = false; state = 'title';
+}
+
+function newComposition() {
+  compNo++; loadComp();
+  if (state !== 'title') spawnBall();
+}
+function startRotate() {
+  state = 'rotate'; rotT = 0;
+  ballInSq = B.alive && B.x > S0 && B.x < S1 && B.y > S0 && B.y < S1;
+  tone(180, ROT_DUR, 0.12, 'sine', 0, 360);
+}
+function endRotate() {
+  K = (K + 1) % 4; buildWorld();
+  if (ballInSq) { const p = rp(B.x, B.y, 1); B.x = p[0]; B.y = p[1]; const vx = B.vx; B.vx = -B.vy; B.vy = vx; trail.length = 0; }
+  // A ball that was resting doesn't drop dead straight after a turn: the turn throws it sideways,
+  // toward the nearest doorway in the floor it will land on. It never moves by itself otherwise.
+  if (ballInSq && Math.hypot(B.vx, B.vy) < 150) {
+    const cell = world.cells.find(r => B.x > r.x0 && B.x < r.x1 && B.y > r.y0 && B.y < r.y1);
+    if (cell) {
+      const cov = [];
+      for (const sg of world.segs) if (sg.inner && Math.abs(sg.ay - cell.y1) < 1 && Math.abs(sg.by - cell.y1) < 1) cov.push([Math.min(sg.ax, sg.bx) - LINE_R, Math.max(sg.ax, sg.bx) + LINE_R]);
+      cov.sort((a, b) => a[0] - b[0]);
+      let t = cell.x0, best = null;
+      const consider = (a, b) => { if (b - a < B.r * 2 + 12) return; const tx = clamp((a + b) / 2, a + B.r + 6, b - B.r - 6); if (best === null || Math.abs(tx - B.x) < Math.abs(best - B.x)) best = tx; };
+      if (cell.y1 < S1 - 1) { for (const c of cov) { if (c[0] > t) consider(t, Math.min(c[0], cell.x1)); t = Math.max(t, c[1]); } if (t < cell.x1) consider(t, cell.x1); }
+      const d = best === null ? (B.x < (cell.x0 + cell.x1) / 2 ? 1 : -1) * 200 : best - B.x;
+      if (Math.abs(d) > 4) B.vx = Math.sign(d) * clamp(Math.abs(d) * 0.55 + 60, 90, 460);
+    }
+  }
+  state = 'play'; rotCd = ROT_COOLDOWN; still = 0;
+  checkBalance();
+}
+function startWin() {
+  collection[compNo - 1] = snapshot(); if (!comp.finale) paintWeights[compNo - 1] = paintingWeight();
+  state = 'win'; winT = 0; swapped = false; shake = 0;
+  [261.63, 329.63, 392.0, 523.25, 659.25].forEach((f, i) => piano(f, 0.18, i * 0.09));
+}
+
+function update(dt) {
+  time += dt;
+  if (state === 'pause') return;
+  if (state === 'gallery') { galT += dt; return; }
+  if (state !== 'title') musicTick();
+  wallSoundCd -= dt; rotCd -= dt;
+  shake = Math.max(0, shake - dt * 30);
+  const lh = isLeft(), rh = isRight();
+  if (state !== 'title') {
+    if (lh && !prevL) tone(140, 0.06, 0.22, 'sine');
+    if (rh && !prevR) tone(150, 0.06, 0.22, 'sine');
+  }
+  prevL = lh; prevR = rh;
+
+  acc += dt;
+  while (acc >= STEP) {
+    updateFlipper(FL, lh && state !== 'title', STEP); updateFlipper(FR, rh && state !== 'title', STEP);
+    if (state === 'play' && B.alive) physStep(STEP);
+    acc -= STEP;
+  }
+
+  if (state === 'play') {
+    checkBalance();
+    // rotation: hold both flippers
+    if (lh && rh && rotCd <= 0) { charge += dt; if (charge >= CHARGE) { charge = 0; startRotate(); } }
+    else charge = Math.max(0, charge - dt * 3);
+
+    if (B.alive) {
+      trail.push([B.x, B.y]); if (trail.length > 14) trail.shift();
+      const inSq = B.x > S0 && B.x < S1 && B.y > S0 && B.y < S1;
+      still = (inSq && Math.hypot(B.vx, B.vy) < 25) ? still + dt : 0;
+      if (comp.finale) {
+        const cell = inSq ? world.cells.find(r => B.x > r.x0 && B.x < r.x1 && B.y > r.y0 && B.y < r.y1) : null;
+        const l = cell && cell.leaf.tile != null ? cell.leaf : null;
+        if (finLeaf !== l) { if (finLeaf) { finLeaf.visited = false; finLeaf.prog = 0; } finLeaf = l; }
+        if (l && !l.visited) {
+          l.prog += dt / (l.hung ? 1.2 : 0.4);
+          if (l.prog >= 1) { l.hung = !l.hung; l.visited = true; l.prog = 0; l.hangT = 0; chord(['red', 'blue', 'yellow'][l.tile % 3]); checkBalance(); }
+        }
+      }
+      // painting: dwell in an open cell with a coloured ball
+      if (B.color) {
+        const cell = world.cells.find(r => B.x > r.x0 && B.x < r.x1 && B.y > r.y0 && B.y < r.y1);
+        if (cell) {
+          const l = cell.leaf;
+          if (l.color !== B.color) {
+            if (l.progColor !== B.color) { l.progColor = B.color; l.prog = 0; }
+            l.prog += dt / (0.3 + (cell.x1 - cell.x0) * (cell.y1 - cell.y0) / 80000);
+            if (l.prog >= 1) { l.prevColor = l.color; l.color = B.color; l.prog = 0; l.progColor = null; l.fillT = 0; chord(B.color); checkBalance(); }
+          }
+        }
+      }
+      if (B.y > H + 20) { B.alive = false; respawnT = 0.9; drains++; tone(90, 0.4, 0.2, 'sine', 0, 50); }
+    } else if ((respawnT -= dt) <= 0) spawnBall();
+  } else if (state === 'rotate') {
+    rotT += dt; if (rotT >= ROT_DUR) endRotate();
+  } else if (state === 'win') {
+    winT += dt;
+    if (winT >= 1.4 && !swapped && compNo >= TOTAL) { state = 'gallery'; galT = 0; B.alive = false; return; }
+    if (winT >= 1.4 && !swapped) { swapped = true; compNo++; loadComp(); B.alive = false; }
+    if (winT >= 1.9) { state = 'play'; spawnBall(); }
+  }
+
+  for (const l of comp.leaves) { l.flash = Math.max(0, l.flash - dt * 5); l.fillT = Math.min(1, l.fillT + dt * 4); if (l.progColor && l.prog > 0) l.prog = Math.max(0, l.prog - dt * 0.04); }
+  for (const l of comp.leaves) if (l.hangT < 1) l.hangT += dt * 3;
+  const b = balance();
+  beam += (clamp(b.dx / 120, -1, 1) * 0.32 - beam) * Math.min(1, dt * 6);
+}
+
+// ------------------------------------------------------------------ render
+function rect(r, inset = 0) { ctx.fillRect(r.x0 + inset, r.y0 + inset, r.x1 - r.x0 - inset * 2, r.y1 - r.y0 - inset * 2); }
+
+function drawComposition() {
+  if (comp.finale) for (const l of comp.leaves) {
+    if (l.tile == null || !collection[l.tile]) continue;
+    const r = l.w, m = 13, w = r.x1 - r.x0 - 2 * m, e = easeOut(Math.min(1, l.hangT));
+    const a = l.hung ? 0.14 + 0.86 * e : 1 - 0.86 * e;
+    ctx.save(); ctx.globalAlpha *= a;
+    ctx.translate((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2); ctx.rotate(K * Math.PI / 2);
+    ctx.drawImage(collection[l.tile], -w / 2, -w / 2, w, w);
+    ctx.restore();
+    ctx.strokeStyle = INK; ctx.lineWidth = l.hung ? 3 : 1; ctx.strokeRect(r.x0 + m, r.y0 + m, w, w);
+    if (l.prog > 0 && !l.visited) { ctx.fillStyle = COL.red; ctx.fillRect(r.x0 + m, r.y1 - 9, w * l.prog, 4); }
+  }
+  for (const l of comp.leaves) {
+    const r = l.w, c = l.solid || l.color;
+    if (!c && !(l.progColor && l.prog > 0)) continue;
+    if (l.solid) {
+      ctx.fillStyle = COL[c]; rect(r);
+      if (l.flash > 0) { ctx.fillStyle = `rgba(248,246,240,${l.flash * 0.7})`; rect(r, (1 - l.flash) * 10); }
+    } else {
+      if (l.color) {
+        if (l.fillT < 1 && l.prevColor) { ctx.fillStyle = COL[l.prevColor]; rect(r); }
+        const e = easeOut(l.fillT), cx = (r.x0 + r.x1) / 2, cy = (r.y0 + r.y1) / 2;
+        ctx.fillStyle = COL[l.color];
+        ctx.fillRect(cx - (cx - r.x0) * e, cy - (cy - r.y0) * e, (r.x1 - r.x0) * e, (r.y1 - r.y0) * e);
+      }
+      if (l.progColor && l.prog > 0) {          // fill-in progress, rising from the bottom
+        ctx.fillStyle = COL[l.progColor]; ctx.globalAlpha *= 0.28;
+        const h = (r.y1 - r.y0) * l.prog; ctx.fillRect(r.x0, r.y1 - h, r.x1 - r.x0, h);
+        ctx.globalAlpha /= 0.28;
+      }
+    }
+  }
+  ctx.strokeStyle = INK; ctx.lineWidth = LINE_R * 2; ctx.lineCap = 'square';
+  ctx.beginPath();
+  for (const s of world.segs) if (s.inner) { ctx.moveTo(s.ax, s.ay); ctx.lineTo(s.bx, s.by); }
+  ctx.stroke();
+}
+
+function drawBall() {
+  if (!B.alive) return;
+  const col = B.color ? COL[B.color] : INK;
+  for (let i = 0; i < trail.length; i++) {
+    const a = i / trail.length; ctx.globalAlpha = a * 0.35; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(trail[i][0], trail[i][1], B.r * (0.35 + a * 0.5), 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.beginPath(); ctx.arc(B.x, B.y, B.r, 0, 7);
+  ctx.fillStyle = B.color ? COL[B.color] : PAPER; ctx.fill();
+  ctx.lineWidth = 3; ctx.strokeStyle = INK; ctx.stroke();
+}
+
+function drawFlipper(f) {
+  const c = Math.cos(f.th), s = Math.sin(f.th), tx = f.px + c * f.L, ty = f.py + s * f.L, nx = -s, ny = c;
+  ctx.fillStyle = INK;
+  ctx.beginPath();
+  ctx.moveTo(f.px + nx * 12, f.py + ny * 12); ctx.lineTo(tx + nx * 7, ty + ny * 7);
+  ctx.lineTo(tx - nx * 7, ty - ny * 7); ctx.lineTo(f.px - nx * 12, f.py - ny * 12); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.arc(f.px, f.py, 12, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(tx, ty, 7, 0, 7); ctx.fill();
+  ctx.fillStyle = PAPER; ctx.beginPath(); ctx.arc(f.px, f.py, 3, 0, 7); ctx.fill();
+}
+
+function txt(s, x, y, size, color = INK, align = 'left', weight = 600, spacing = 0) {
+  ctx.font = `${weight} ${size}px "Jost","Futura","Avenir Next","Helvetica Neue",Arial,sans-serif`;
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'alphabetic';
+  if ('letterSpacing' in ctx) ctx.letterSpacing = spacing + 'px';
+  ctx.fillText(s, x, y);
+  if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+}
+
+function drawHUD() {
+  if (state === 'title') return;
+  const b = balance();
+  if (state === 'gallery') return;
+  txt('COMPOSITION No. ' + compNo, 28, 832, 13, INK, 'left', 700, 2);
+  for (let i = 0; i < TOTAL; i++) {
+    const x = 28 + i * 12, y = 841;
+    if (i < compNo - 1 || collection[i]) { ctx.fillStyle = INK; ctx.fillRect(x, y, 8, 8); }
+    else if (i === compNo - 1) { ctx.fillStyle = COL.red; ctx.fillRect(x, y, 8, 8); }
+    else { ctx.strokeStyle = '#C9C3B5'; ctx.lineWidth = 1.5; ctx.strokeRect(x + 0.75, y + 0.75, 6.5, 6.5); }
+  }
+  // v1 balance beam, unlabelled
+  const bx = 110, by = 878;
+  ctx.fillStyle = INK; ctx.beginPath(); ctx.moveTo(bx, by - 2); ctx.lineTo(bx - 7, by + 10); ctx.lineTo(bx + 7, by + 10); ctx.closePath(); ctx.fill();
+  ctx.save(); ctx.translate(bx, by - 3); ctx.rotate(beam);
+  const t = tol(), ok = Math.abs(b.dx) < t;
+  ctx.fillStyle = ok ? COL.red : INK; ctx.fillRect(-72, -2, 144, 3);
+  // the balanced zone, as a red strip on the beam that gets narrower each composition
+  const tz = t * 72 / 90; ctx.fillStyle = COL.red; ctx.fillRect(-tz, 1, tz * 2, 3);
+  const mx = clamp(b.dx, -90, 90) * 72 / 90;
+  ctx.fillStyle = INK; ctx.fillRect(mx - 4, -10, 8, 8);
+  ctx.restore();
+  // rotation readiness ring
+  ctx.fillStyle = INK; ctx.fillRect(PBTN.x, PBTN.y, 5, PBTN.h); ctx.fillRect(PBTN.x + 11, PBTN.y, 5, PBTN.h);
+  const cx = 596, cy = 870;
+  ctx.lineWidth = 3; ctx.strokeStyle = '#D6D1C4'; ctx.beginPath(); ctx.arc(cx, cy, 11, 0, 7); ctx.stroke();
+  const p = rotCd > 0 ? 1 - rotCd / ROT_COOLDOWN : charge / CHARGE;
+  ctx.strokeStyle = rotCd > 0 ? MUTED : INK; ctx.beginPath(); ctx.arc(cx, cy, 11, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2); ctx.stroke();
+
+  if (!document.hasFocus()) {
+    ctx.fillStyle = INK; ctx.fillRect(C - 130, 6, 260, 28);
+    txt('CLICK TO USE THE KEYBOARD', C, 24, 11, PAPER, 'center', 700, 2.5);
+  }
+  if (state === 'play' && still > 1.4 && B.alive) txt('HOLD BOTH SHIFTS', C, 650, 11, MUTED, 'center', 700, 2.5);
+}
+
+// shift-key glyph, drawn so it matches the line weight of the keycaps
+function shiftGlyph(cx, cy, k = 1) {
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - 8 * k); ctx.lineTo(cx + 8 * k, cy); ctx.lineTo(cx + 4 * k, cy); ctx.lineTo(cx + 4 * k, cy + 7 * k);
+  ctx.lineTo(cx - 4 * k, cy + 7 * k); ctx.lineTo(cx - 4 * k, cy); ctx.lineTo(cx - 8 * k, cy); ctx.closePath();
+  ctx.lineJoin = 'miter'; ctx.stroke();
+}
+function keycap(x, y, w) {
+  ctx.strokeStyle = INK; ctx.lineWidth = 2;
+  ctx.strokeRect(x + 1, y + 1, w - 2, 38);
+  shiftGlyph(x + w / 2, y + 20);
+}
+
+function drawGallery() {
+  ctx.fillStyle = PAPER; ctx.fillRect(0, 0, W, H);
+  const L = 80, R = 560, top = 158, size = R - L, g = 8, tile = (size - 4 * g) / 3, foot = 34;
+  txt('YOUR COLLECTION', L - 2, 92, 28, INK, 'left', 700, 4);
+  txt('NINE COMPOSITIONS IN BALANCE', L, 116, 11, MUTED, 'left', 700, 2.5);
+  // hung from one nail: it starts crooked and swings level
+  const nail = { x: C, y: top - 18 }, ang = -0.11 * Math.exp(-1.7 * galT) * Math.cos(4.4 * galT);
+  ctx.save(); ctx.translate(nail.x, nail.y); ctx.rotate(ang); ctx.translate(-nail.x, -nail.y);
+  ctx.strokeStyle = INK; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(L + 90, top); ctx.lineTo(nail.x, nail.y); ctx.lineTo(R - 90, top); ctx.stroke();
+  ctx.fillStyle = INK; ctx.fillRect(L, top, size, size + foot);
+  collection.forEach((im, i) => {
+    const a = clamp((galT - 0.15 * i) / 0.35, 0, 1); if (a <= 0 || !im) return;      // tiles arrive one by one
+    const x = L + g + (i % 3) * (tile + g), y = top + g + Math.floor(i / 3) * (tile + g);
+    ctx.globalAlpha = a; ctx.drawImage(im, x, y, tile, tile); ctx.globalAlpha = 1;
+  });
+  txt('COUNTERWEIGHT', L + g, top + size + 21, 10, PAPER, 'left', 700, 3);
+  const cursor = Math.floor(time * 2) % 2 === 0 && sig.length < 3 ? '_' : '';
+  if (sig || cursor) txt(sig + cursor, R - g, top + size + 23, 15, PAPER, 'right', 700, 3);
+  ctx.restore();
+  ctx.fillStyle = INK; ctx.beginPath(); ctx.arc(nail.x, nail.y, 4, 0, 7); ctx.fill();
+  GBTN.forEach((b, i) => {
+    const hov = galHover === i;
+    if (i === 0) { ctx.fillStyle = hov ? COL.red : INK; ctx.fillRect(b.x, b.y, b.w, b.h); ctx.fillStyle = hov ? INK : COL.red; ctx.fillRect(b.x + b.w - 16, b.y, 16, b.h); txt(b.label, b.x + 24, b.y + 35, 14, PAPER, 'left', 700, 4); }
+    else { ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.strokeRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2); if (hov) { ctx.fillStyle = INK; ctx.fillRect(b.x, b.y, b.w, b.h); } txt(b.label, b.x + 24, b.y + 35, 14, hov ? PAPER : INK, 'left', 700, 4); }
+  });
+  ctx.fillStyle = INK; ctx.fillRect(L, 812, R - L, 1);
+  txt('Type your initials to sign it. Enter to play again.', L, 840, 12, MUTED, 'left', 500);
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(248,246,240,0.86)'; ctx.fillRect(0, 0, W, H);
+  txt('PAUSED', MENU_X, MENU_Y0 - 84, 11, MUTED, 'left', 700, 2.5);
+  MENU.forEach((m, i) => {
+    const y = MENU_Y0 + i * MENU_DY, sel = i === menuSel;
+    if (sel) { ctx.fillStyle = COL.red; ctx.fillRect(MENU_X - 36, y - 22, 16, 16); }
+    txt(m.label(), MENU_X, y, 30, sel ? INK : MUTED, 'left', 700, 5);
+  });
+  txt('ESC TO RESUME', MENU_X, MENU_Y0 + MENU.length * MENU_DY + 24, 11, MUTED, 'left', 700, 2.5);
+}
+
+function drawTitle() {
+  ctx.fillStyle = PAPER; ctx.fillRect(0, 0, W, H);
+  const L = 80, R = 560;                          // one column: 80 px margins
+
+  // motif: a small Mondrian on the same column
+  ctx.fillStyle = COL.red;    ctx.fillRect(L, 112, 142, 130);
+  ctx.fillStyle = COL.yellow; ctx.fillRect(230, 250, 64, 62);
+  ctx.fillStyle = COL.blue;   ctx.fillRect(480, 250, R - 480, 62);
+  ctx.fillStyle = INK;
+  ctx.fillRect(222, 112, 8, 200);                 // vertical
+  ctx.fillRect(472, 112, 8, 200);                 // vertical
+  ctx.fillRect(L, 242, R - L, 8);                 // horizontal
+  ctx.fillRect(480, 176, R - 480, 8);             // short horizontal
+
+  // title — the one large thing on the page
+  txt('COUNTERWEIGHT', L - 3, 412, 48, INK, 'left', 700, 4);
+
+  // controls as keycaps, labels underneath in caption style
+  const y = 470;
+  keycap(L, y, 56);           txt('LEFT', L, y + 62, 11, MUTED, 'left', 700, 2.5);
+  keycap(L + 96, y, 56);      txt('RIGHT', L + 96, y + 62, 11, MUTED, 'left', 700, 2.5);
+  keycap(L + 192, y, 56); keycap(L + 276, y, 56);
+  txt('+', L + 262, y + 26, 18, INK, 'center', 500);
+  txt('HOLD BOTH', L + 192, y + 62, 11, MUTED, 'left', 700, 2.5);
+
+  // primary action
+  ctx.fillStyle = btnHover ? COL.red : INK; ctx.fillRect(BTN.x, BTN.y, BTN.w, BTN.h);
+  ctx.fillStyle = btnHover ? INK : COL.red; ctx.fillRect(BTN.x + BTN.w - 16, BTN.y, 16, BTN.h);
+  txt('START', BTN.x + 28, BTN.y + 35, 16, PAPER, 'left', 700, 6);
+
+  // footer: smallest, quietest
+  ctx.fillStyle = INK; ctx.fillRect(L, 812, R - L, 1);
+  txt('Or use Z and /, or tap either half of the screen. Esc to pause.', L, 840, 12, MUTED, 'left', 500);
+}
+
+function render() {
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+  ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+  if (shake > 0) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
+
+  // table paper (painting + funnel)
+  ctx.fillStyle = PAPER;
+  ctx.beginPath(); ctx.moveTo(S0, S0); ctx.lineTo(S1, S0); ctx.lineTo(S1, S1); ctx.lineTo(RP.x, RP.y); ctx.lineTo(RP.x, H); ctx.lineTo(LP.x, H); ctx.lineTo(LP.x, LP.y); ctx.lineTo(S0, S1); ctx.closePath(); ctx.fill();
+
+  // painting (rotates as one object)
+  ctx.save();
+  ctx.beginPath(); ctx.rect(S0, S0, S1 - S0, S1 - S0); ctx.clip();
+  let alpha = 1;
+  if (state === 'rotate') {
+    const t = rotT / ROT_DUR, a = easeInOut(t) * Math.PI / 2, sc = 1 - 0.1 * Math.sin(Math.PI * t);
+    ctx.translate(C, C); ctx.rotate(a); ctx.scale(sc, sc); ctx.translate(-C, -C);
+  }
+  if (state === 'win') alpha = winT < 1.0 ? 1 : winT < 1.4 ? 1 - (winT - 1.0) / 0.4 : clamp((winT - 1.4) / 0.5, 0, 1);
+  ctx.globalAlpha = alpha;
+  drawComposition();
+  ctx.globalAlpha = 1;
+  if (state === 'rotate' && ballInSq) drawBall();
+  ctx.restore();
+
+  // fixed frame + funnel
+  ctx.strokeStyle = INK; ctx.lineCap = 'square'; ctx.lineWidth = FRAME_R * 2;
+  ctx.beginPath(); ctx.moveTo(S0, S1); ctx.lineTo(S0, S0); ctx.lineTo(S1, S0); ctx.lineTo(S1, S1); ctx.stroke();
+  ctx.lineCap = 'round'; ctx.lineWidth = FUNNEL_R * 2;
+  ctx.beginPath(); ctx.moveTo(S0, S1); ctx.lineTo(LP.x, LP.y); ctx.moveTo(S1, S1); ctx.lineTo(RP.x, RP.y); ctx.stroke();
+
+  drawFlipper(FL); drawFlipper(FR);
+  if (!(state === 'rotate' && ballInSq) && state !== 'win') drawBall();
+
+  if (state === 'win' && winT < 1.4) {
+    ctx.fillStyle = INK; ctx.fillRect(S0, C - 34, S1 - S0, 68);
+    txt('BALANCED', C, C + 12, 32, PAPER, 'center', 700, 12);
+  }
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+  drawHUD();
+  if (state === 'title') drawTitle();
+  if (state === 'pause') drawPause();
+  if (state === 'gallery') drawGallery();
+}
+
+// ------------------------------------------------------------------ boot
+comp = generate(1007); buildWorld();
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt); render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.__cwb = { get finaleTol() { return finaleTol; }, get sig() { return sig; }, startGame, endRotate, newComposition, get K() { return K; }, get collection() { return collection; }, snapshot, startWin, get compNo() { return compNo; }, set compNo(v) { compNo = v; }, physStep, B, world, get state() { return state; }, get comp() { return comp; }, balance, held, update, startRotate };
+})();
+</script>
+</body>
+</html>
