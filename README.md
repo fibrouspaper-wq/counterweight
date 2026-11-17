@@ -25,6 +25,10 @@ The only controls are the two Shift keys. Bounce the ball off the colour blocks,
 - Holding both shifts the painting a quarter turn, which shifts gravity and the table layout.
 - Every stroke of paint shifts the composition's weight.
 
+## Design notes
+
+How the hidden balance works, why blue, red and yellow weigh what they do, how the difficulty curve was tuned, and what was tried and cut along the way: **[docs/BALANCING.md](docs/BALANCING.md)**.
+
 ## Run it
 
 It is a single file with no build step and no dependencies. Open `index.html` in a browser.
