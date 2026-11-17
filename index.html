@@ -33,7 +33,8 @@ const ROT_DUR = 0.55, CHARGE = 0.45, ROT_COOLDOWN = 1.2;
 const GOAL = 1;                       // at least one painted cell
 // balanced zone shrinks with each composition: 20, 17, 14, 11, 9, 8 … px (v1 was a fixed 18)
 let finaleTol = 8;
-const tol = () => (comp && comp.finale) ? finaleTol : Math.max(8, 20 - (compNo - 1) * 3 - (compNo > 4 ? 1 : 0));
+const TOL_CURVE = [21, 18, 16, 14, 12, 11, 10, 10, 10];   // balanced zone (px either side of centre) for compositions 1–9
+const tol = () => (comp && comp.finale) ? finaleTol : TOL_CURVE[Math.min(compNo, 9) - 1];
 
 // ------------------------------------------------------------------ canvas
 const cv = document.getElementById('c'); let ctx = cv.getContext('2d');
